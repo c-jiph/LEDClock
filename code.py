@@ -38,7 +38,6 @@ def rainbow_animation_frame(offset):
     for i in range(PIXEL_COUNT):
         pixel_index = (i * 256 // PIXEL_COUNT) + offset
         pixels[i] = wheel(pixel_index & 255)
-    print(pixels)
     pixels.show()
 
 
@@ -167,9 +166,8 @@ def saturating_decrement(color, amount):
     return tuple(max(0, channel - amount) for channel in color)
 
 
-def display_clock():
+def display_clock(current_time):
     """Display current time on the LED ring."""
-    current_time = time.localtime()
     hour = current_time.tm_hour
     minute = current_time.tm_min
     second = current_time.tm_sec
@@ -206,22 +204,24 @@ def display_clock():
 
 def main():
     """Main program loop."""
-    print("XXXX")
     rainbow_animation_frame(0)
     connect_wifi()
-    sync_time()
 
     print("Starting clock display...")
 
+    last_sync_hour = -1
     while True:
-        # Display the clock
-        display_clock()
-
-        # Resync time every hour
-        if time.localtime().tm_min == 0:
+        current_time = time.localtime()
+        if current_time.tm_hour != last_sync_hour:
             try:
                 sync_time()
             except Exception as e:
                 print(f"Background NTP sync failed: {e}")
+            last_sync_hour = current_time.tm_hour
+            # In case the update was slow
+            current_time = time.localtime()
+
+        # Display the clock
+        display_clock(current_time)
 
 main()
