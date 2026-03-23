@@ -1,0 +1,6 @@
+In the current directory is a file code.py written in CircuitPython. This is to be run on a microcontroller which has 60, addressable, RGB LEDs, and a WiFi device. Physically the LEDs are in a loop so #0 is next to #59. For examples of how to use WiFi see ../TapeMachine/main.py
+
+Implement a program which turns the LEDs into a clock. Use a single green "pixel" for the current second, a blue "pixel" for the current minute, and 5 red pixels centered around the current hour. Multiple time indicators can occupy the same pixel. As pixels advance around the ring, have the previous versions fade out over a few frames.
+
+To get the time use NTP + WiFi. On initial startup block until we get the initial time and have a rainbow animation moving around the loop to indicate we're waiting for the initial sync. Resync the time every hour but don't block on this and don't display any indication.
+
