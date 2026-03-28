@@ -1,15 +1,21 @@
+import time
+
+import adafruit_httpserver
+import adafruit_ntp
 import board
 import neopixel
-import time
-import wifi
-import socketpool
-import adafruit_ntp
 import rtc
+import socketpool
+import sys
+import wifi
+from adafruit_httpserver import POST, PUT
 
-PIXEL_PIN = board.IO16
+from animation import ClockAnimationCore, ClockPlatform, load_core_class_from_source, wheel
+
+PIXEL_PIN = board.IO16 if "FooToy" in sys.implementation._machine else board.IO0
 PIXEL_COUNT = 60
 BRIGHTNESS = 0.2
-FADE_STEP = 51  # Per-frame decrement so a fully lit channel fades out in ~5 frames
+SERVER_PORT = 81
 
 # WiFi credentials
 try:
@@ -17,38 +23,6 @@ try:
 except ImportError:
     print("WiFi secrets are kept in secrets.py, please add them there!")
     raise
-
-pixels = neopixel.NeoPixel(PIXEL_PIN, PIXEL_COUNT, brightness=BRIGHTNESS, auto_write=False)
-
-
-def wheel(pos):
-    """Generate rainbow colors across 0-255 positions."""
-    if pos < 85:
-        return (pos * 3, 255 - pos * 3, 0)
-    elif pos < 170:
-        pos -= 85
-        return (255 - pos * 3, 0, pos * 3)
-    else:
-        pos -= 170
-        return (0, pos * 3, 255 - pos * 3)
-
-
-def rainbow_animation_frame(offset):
-    """Display one frame of rainbow animation."""
-    for i in range(PIXEL_COUNT):
-        pixel_index = (i * 256 // PIXEL_COUNT) + offset
-        pixels[i] = wheel(pixel_index & 255)
-    pixels.show()
-
-
-def connect_wifi():
-    """Blocking connect to WiFi."""
-    print("Connecting to WiFi...")
-
-    # Try to connect
-    wifi.radio.connect(secrets['ssid'], secrets['password'])
-
-    print(f"Connected to WiFi! IP: {wifi.radio.ipv4_address}")
 
 
 def day_of_week(year, month, day):
@@ -63,87 +37,56 @@ def day_of_week(year, month, day):
     m = month
     k = year % 100
     j = year // 100
-
     h = (q + ((13 * (m + 1)) // 5) + k + (k // 4) + (j // 4) - (2 * j)) % 7
-
-    # Convert Zeller's output (0=Sat) to our format (0=Sun)
     return (h + 6) % 7
 
 
 def find_nth_weekday(year, month, weekday, n):
-    """Find the nth occurrence of a weekday in a month.
-    weekday: 0=Sunday, 1=Monday, ..., 6=Saturday
-    n: 1=first, 2=second, etc.
-    Returns the day of month.
-    """
-    # Find the first occurrence of the weekday
     first_day_of_month = day_of_week(year, month, 1)
     first_occurrence = 1 + (weekday - first_day_of_month) % 7
-
-    # Calculate the nth occurrence
     return first_occurrence + (n - 1) * 7
 
 
 def is_dst(year, month, day, hour):
-    """Check if date/time is in DST (US rules).
-    DST starts: 2nd Sunday in March at 2:00 AM
-    DST ends: 1st Sunday in November at 2:00 AM
-    """
-    # Before March or after November
     if month < 3 or month > 11:
         return False
 
-    # April through October - always DST
     if month > 3 and month < 11:
         return True
 
-    # March - check if we're past 2nd Sunday at 2 AM
     if month == 3:
-        dst_start_day = find_nth_weekday(year, 3, 0, 2)  # 2nd Sunday
+        dst_start_day = find_nth_weekday(year, 3, 0, 2)
         if day < dst_start_day:
             return False
-        elif day > dst_start_day:
+        if day > dst_start_day:
             return True
-        else:  # day == dst_start_day
-            return hour >= 2
+        return hour >= 2
 
-    # November - check if we're before 1st Sunday at 2 AM
     if month == 11:
-        dst_end_day = find_nth_weekday(year, 11, 0, 1)  # 1st Sunday
+        dst_end_day = find_nth_weekday(year, 11, 0, 1)
         if day < dst_end_day:
             return True
-        elif day > dst_end_day:
+        if day > dst_end_day:
             return False
-        else:  # day == dst_end_day
-            return hour < 2
+        return hour < 2
 
     return False
 
 
 def get_pacific_tz_offset():
-    """Get timezone offset for Pacific Time with DST handling.
-    Returns -7 during PDT (Daylight Time) or -8 during PST (Standard Time).
-    """
-    # Get current UTC time to determine DST
-    # We'll get it after first sync and check
     current = time.localtime()
-
     if is_dst(current.tm_year, current.tm_mon, current.tm_mday, current.tm_hour):
-        return -7  # PDT (Pacific Daylight Time)
-    else:
-        return -8  # PST (Pacific Standard Time)
+        return -7
+    return -8
 
 
 def sync_time():
-    """Sync time using NTP with DST-aware Pacific Time."""
     print("Syncing time via NTP...")
     pool = socketpool.SocketPool(wifi.radio)
 
-    # First sync with UTC to determine DST
     ntp = adafruit_ntp.NTP(pool, tz_offset=0)
     rtc.RTC().datetime = ntp.datetime
 
-    # Now get the correct offset and resync
     tz_offset = get_pacific_tz_offset()
     ntp = adafruit_ntp.NTP(pool, tz_offset=tz_offset)
     rtc.RTC().datetime = ntp.datetime
@@ -152,76 +95,186 @@ def sync_time():
     print(f"Time synced ({tz_name}): {time.localtime()}")
 
 
-def get_led_position_for_hour(hour):
-    """Convert hour (0-23) to LED position (0-59).
-    Maps 12-hour format to 60 LEDs, centered at 0, 5, 10, 15, etc.
-    At 12:00, center is at LED 0 (displays 58, 59, 0, 1, 2).
-    """
-    hour_12 = hour % 12
-    return hour_12 * 5
+def connect_wifi():
+    print("Connecting to WiFi...")
+    wifi.radio.connect(secrets["ssid"], secrets["password"])
+    print(f"Connected to WiFi! IP: {wifi.radio.ipv4_address}")
 
 
-def saturating_decrement(color, amount):
-    """Fade a pixel by subtracting from each channel without going below zero."""
-    return tuple(max(0, channel - amount) for channel in color)
+class ClockHost:
+    def __init__(self, platform, default_core_cls):
+        self.platform = platform
+        self.default_core_cls = default_core_cls
+        self.core = default_core_cls(platform)
+        self.core_source = None
+        self.http_server = None
+        self.last_sync_hour = -1
 
+    def rainbow_animation_frame(self, offset):
+        for i in range(self.platform.pixel_count):
+            pixel_index = (i * 256 // self.platform.pixel_count) + offset
+            self.platform.set_pixel(i, wheel(pixel_index & 255))
+        self.platform.show()
 
-def display_clock(current_time):
-    """Display current time on the LED ring."""
-    hour = current_time.tm_hour
-    minute = current_time.tm_min
-    second = current_time.tm_sec
+    def install_core_class(self, core_cls, source=None):
+        new_core = core_cls(self.platform, config=self.core.config)
+        self.core = new_core
+        self.core_source = source
+        print("Active animation core updated without restarting HTTP server")
+        return self.core.get_state()
 
-    # Fade the existing display in place.
-    for i in range(PIXEL_COUNT):
-        pixels[i] = saturating_decrement(pixels[i], FADE_STEP)
+    def reset_core(self):
+        return self.install_core_class(self.default_core_cls, source=None)
 
-    # Get LED positions
-    hour_pos = get_led_position_for_hour(hour) - 1
-    minute_pos = minute - 1
-    second_pos = second - 1
+    def get_state(self):
+        state = self.core.get_state()
+        state["source"] = "builtin" if self.core_source is None else "uploaded"
+        return state
 
-    # Hour (3 red pixels centered around hour position).
-    for offset in range(-1, 2):
-        pos = (hour_pos + offset) % PIXEL_COUNT
-        _, g, b = pixels[pos]
-        pixels[pos] = (255, g, b)
+    def tick(self):
+        current_time = self.platform.now()
+        if current_time.tm_hour != self.last_sync_hour:
+            try:
+                sync_time()
+            except Exception as exc:
+                self.platform.logger(f"Background NTP sync failed: {exc}")
+            self.last_sync_hour = current_time.tm_hour
+            current_time = self.platform.now()
 
-    # Minute (blue pixel).
-    r, g, _ = pixels[minute_pos]
-    pixels[minute_pos] = (r, g, 255)
+        self.poll_http()
+        self.core.tick(current_time=current_time)
 
-    # Second (green pixel).
-    r, _, b = pixels[second_pos]
-    pixels[second_pos] = (r, 255, b)
+    def make_webserver(self, socket_pool):
+        server = adafruit_httpserver.Server(socket_pool, debug=True)
 
-    # Update LED strip
-    pixels.show()
+        @server.route("/animation/ping")
+        def ping(request):
+            print("HTTP GET /animation/ping")
+            return adafruit_httpserver.JSONResponse(
+                request,
+                {
+                    "ip": str(wifi.radio.ipv4_address),
+                    "name": self.core.NAME,
+                    "version": self.core.VERSION,
+                },
+            )
 
-    # Update at ~30 FPS for smooth fading
-    time.sleep(0.033)
+        @server.route("/animation/state")
+        def animation_state(request):
+            print("HTTP GET /animation/state")
+            return adafruit_httpserver.JSONResponse(request, self.get_state())
+
+        @server.route("/animation/config", [PUT, POST])
+        def animation_config(request):
+            data = request.json()
+            print(f"HTTP {request.method} /animation/config payload={data}")
+            if not isinstance(data, dict):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Expected JSON object"}
+                )
+            try:
+                state = self.core.update_config(data)
+            except (TypeError, ValueError) as exc:
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, state)
+
+        @server.route("/animation/install", [POST, PUT])
+        def animation_install(request):
+            data = request.json()
+            print(f"HTTP {request.method} /animation/install")
+            if not isinstance(data, dict) or "source" not in data:
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Expected JSON object with source"}
+                )
+            source = data["source"]
+            if not isinstance(source, str):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "source must be a string"}
+                )
+            try:
+                print(f"Installing uploaded core source ({len(source)} bytes)")
+                core_cls = load_core_class_from_source(source)
+                state = self.install_core_class(core_cls, source=source)
+                print(f"Installed core {state['name']} v{state['version']}")
+            except Exception as exc:
+                print(f"Install failed: {exc}")
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": f"Install failed: {exc}"}
+                )
+            return adafruit_httpserver.JSONResponse(request, {"ok": True, "state": state})
+
+        @server.route("/animation/reset", [POST, PUT])
+        def animation_reset(request):
+            print(f"HTTP {request.method} /animation/reset")
+            state = self.reset_core()
+            print(f"Reset to core {state['name']} v{state['version']}")
+            return adafruit_httpserver.JSONResponse(
+                request, {"ok": True, "reset": True, "state": state}
+            )
+
+        @server.route("/animation/core", [POST, PUT])
+        def animation_core(request):
+            data = request.json()
+            print(f"HTTP {request.method} /animation/core payload={data}")
+            if not isinstance(data, dict):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Expected JSON object"}
+                )
+            path = data.get("path", "")
+            payload = data.get("data", {})
+            if not isinstance(path, str):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "path must be a string"}
+                )
+            if not isinstance(payload, dict):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "data must be a JSON object"}
+                )
+            try:
+                response = self.core.handle_api(path, payload)
+                print(f"Core API path={path} response={response}")
+            except Exception as exc:
+                print(f"Core API failed for path={path}: {exc}")
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, response)
+
+        base_url = f"http://{wifi.radio.ipv4_address}:{SERVER_PORT}"
+        print(f"Starting HTTP server at {base_url}")
+        print(f"  {base_url}/animation/ping")
+        print(f"  {base_url}/animation/state")
+        print(f"  {base_url}/animation/config")
+        print(f"  {base_url}/animation/install")
+        print(f"  {base_url}/animation/reset")
+        print(f"  {base_url}/animation/core")
+        server.start(port=SERVER_PORT)
+        self.http_server = server
+        return server
+
+    def start_http(self):
+        socket_pool = socketpool.SocketPool(wifi.radio)
+        self.make_webserver(socket_pool)
+
+    def poll_http(self):
+        if self.http_server is None:
+            return
+
+        self.http_server.poll()
 
 
 def main():
-    """Main program loop."""
-    rainbow_animation_frame(0)
+    pixels = neopixel.NeoPixel(
+        PIXEL_PIN, PIXEL_COUNT, brightness=BRIGHTNESS, auto_write=False
+    )
+    platform = ClockPlatform(pixels)
+    host = ClockHost(platform, ClockAnimationCore)
+
+    host.rainbow_animation_frame(0)
     connect_wifi()
+    host.start_http()
 
     print("Starting clock display...")
-
-    last_sync_hour = -1
     while True:
-        current_time = time.localtime()
-        if current_time.tm_hour != last_sync_hour:
-            try:
-                sync_time()
-            except Exception as e:
-                print(f"Background NTP sync failed: {e}")
-            last_sync_hour = current_time.tm_hour
-            # In case the update was slow
-            current_time = time.localtime()
+        host.tick()
 
-        # Display the clock
-        display_clock(current_time)
 
 main()
