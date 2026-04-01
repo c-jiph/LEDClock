@@ -5,6 +5,7 @@ import adafruit_httpserver
 import adafruit_ntp
 import board
 import busio
+import microcontroller
 import neopixel
 import rtc
 import socketpool
@@ -24,6 +25,7 @@ else:
 PIXEL_COUNT = 60
 BRIGHTNESS = 0.2
 SERVER_PORT = 81
+MAX_CONSECUTIVE_NTP_FAILURES = 5
 AMBIENT_SAMPLE_INTERVAL_S = 5
 MIN_PIXEL_BRIGHTNESS = 0.03
 MAX_PIXEL_BRIGHTNESS = 0.8
@@ -410,6 +412,8 @@ class ClockHost:
         self.core_source = None
         self.http_server = None
         self.last_sync_hour = -1
+        self.consecutive_ntp_failures = 0
+        self.start_monotonic = time.monotonic()
         self.ambient_light_controller = ambient_light_controller
 
     def rainbow_animation_frame(self, offset):
@@ -431,17 +435,36 @@ class ClockHost:
     def get_state(self):
         state = self.core.get_state()
         state["source"] = "builtin" if self.core_source is None else "uploaded"
+        state["uptime_s"] = self.get_uptime_s()
         if self.ambient_light_controller is not None:
             state["ambient_light"] = self.ambient_light_controller.get_status()
         return state
+
+    def get_uptime_s(self):
+        return time.monotonic() - self.start_monotonic
 
     def tick(self):
         current_time = self.platform.now()
         if current_time.tm_hour != self.last_sync_hour:
             try:
                 sync_time()
+                self.consecutive_ntp_failures = 0
             except Exception as exc:
+                self.consecutive_ntp_failures += 1
                 self.platform.logger(f"Background NTP sync failed: {exc}")
+                self.platform.logger(
+                    "Consecutive NTP sync failures: "
+                    f"{self.consecutive_ntp_failures}/{MAX_CONSECUTIVE_NTP_FAILURES}"
+                )
+                if (
+                    self.consecutive_ntp_failures >= MAX_CONSECUTIVE_NTP_FAILURES
+                    and 0 <= current_time.tm_hour < 5
+                ):
+                    self.platform.logger(
+                        "NTP sync failed 5 times in a row during the overnight "
+                        "maintenance window; resetting microcontroller"
+                    )
+                    microcontroller.reset()
             self.last_sync_hour = current_time.tm_hour
             current_time = self.platform.now()
 
@@ -462,7 +485,16 @@ class ClockHost:
                     "ip": str(wifi.radio.ipv4_address),
                     "name": self.core.NAME,
                     "version": self.core.VERSION,
+                    "uptime_s": self.get_uptime_s(),
                 },
+            )
+
+        @server.route("/system/uptime")
+        def system_uptime(request):
+            print("HTTP GET /system/uptime")
+            return adafruit_httpserver.JSONResponse(
+                request,
+                {"uptime_s": self.get_uptime_s()},
             )
 
         @server.route("/animation/state")
@@ -612,6 +644,7 @@ class ClockHost:
         print(f"Starting HTTP server at {base_url}")
         print(f"  {base_url}/animation/ping")
         print(f"  {base_url}/animation/state")
+        print(f"  {base_url}/system/uptime")
         print(f"  {base_url}/animation/config")
         print(f"  {base_url}/animation/install")
         print(f"  {base_url}/animation/reset")

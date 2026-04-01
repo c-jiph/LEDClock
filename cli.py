@@ -205,11 +205,16 @@ class SimulatorHost:
         self.core_source = None
         self.ambient_light_controller = ambient_light_controller
         self._lock = threading.RLock()
+        self.start_monotonic = time.monotonic()
+
+    def uptime_s(self):
+        return time.monotonic() - self.start_monotonic
 
     def get_state(self):
         with self._lock:
             state = self.core.get_state()
             state["source"] = "builtin" if self.core_source is None else "uploaded"
+            state["uptime_s"] = self.uptime_s()
             state["ambient_light"] = self.ambient_light_controller.get_status()
             return state
 
@@ -257,7 +262,12 @@ class SimulatorHost:
                 "ip": "127.0.0.1",
                 "name": self.core.NAME,
                 "version": self.core.VERSION,
+                "uptime_s": self.uptime_s(),
             }
+
+    def uptime(self):
+        with self._lock:
+            return {"uptime_s": self.uptime_s()}
 
     def handle_core_api(self, path, data):
         with self._lock:
@@ -351,6 +361,11 @@ class UIBackend:
             return self.host.get_state()
         return self._http("/animation/state")
 
+    def uptime(self):
+        if self.mode == "simulation":
+            return self.host.uptime()
+        return self._http("/system/uptime")
+
     def animation_config(self, payload):
         if self.mode == "simulation":
             return self.host.update_config(payload)
@@ -437,6 +452,7 @@ class UIBackend:
             "target_url": self.target_url,
             "ping": ping,
             "state": state,
+            "uptime": self.uptime(),
             "ambient": ambient,
             "pixels": self.pixel_state(),
             "history": self._history_snapshot(),
@@ -538,6 +554,9 @@ def make_handler(host):
                     return
                 if path == "/animation/state" and method == "GET":
                     self._send_json(200, host.get_state())
+                    return
+                if path == "/system/uptime" and method == "GET":
+                    self._send_json(200, host.uptime())
                     return
                 if path == "/animation/config" and method in ("POST", "PUT"):
                     payload = self._read_json()
@@ -887,6 +906,7 @@ def web_ui_html():
             <span class="pill">Device IP <span id="ipSummary" class="muted">--</span></span>
             <span class="pill">Version <span id="versionSummary" class="muted">--</span></span>
             <span class="pill">Source <span id="sourceSummary" class="muted">--</span></span>
+            <span class="pill">Uptime <span id="uptimeSummary" class="muted">--</span></span>
           </div>
           <pre id="statePre">{}</pre>
         </article>
@@ -1056,6 +1076,17 @@ def web_ui_html():
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
       return Number(value).toFixed(digits);
     }
+    function fmtDuration(seconds) {
+      if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
+      let remaining = Math.max(0, Math.floor(Number(seconds)));
+      const hours = Math.floor(remaining / 3600);
+      remaining -= hours * 3600;
+      const minutes = Math.floor(remaining / 60);
+      const secs = remaining - (minutes * 60);
+      if (hours > 0) return `${hours}h ${minutes}m ${secs}s`;
+      if (minutes > 0) return `${minutes}m ${secs}s`;
+      return `${secs}s`;
+    }
     function log(message, level = "ok") {
       const row = document.createElement("div");
       row.className = "log-entry " + level;
@@ -1193,6 +1224,9 @@ def web_ui_html():
       $("ipSummary").textContent = dashboard.ping?.ip || "--";
       $("versionSummary").textContent = dashboard.state?.version ?? "--";
       $("sourceSummary").textContent = dashboard.state?.source || "--";
+      $("uptimeSummary").textContent = fmtDuration(
+        dashboard.uptime?.uptime_s ?? dashboard.state?.uptime_s ?? dashboard.ping?.uptime_s
+      );
       $("statePre").textContent = JSON.stringify(dashboard.state, null, 2);
       $("metricLuma").textContent = fmt(dashboard.ambient?.last_luma);
       $("metricTarget").textContent = fmt(dashboard.ambient?.last_target_brightness);
@@ -1340,6 +1374,9 @@ def make_ui_handler(backend):
                     return
                 if path == "/api/dashboard" and method == "GET":
                     self._send_json(200, backend.dashboard())
+                    return
+                if path == "/api/system/uptime" and method == "GET":
+                    self._send_json(200, backend.uptime())
                     return
                 if path == "/api/animation/config" and method in ("POST", "PUT"):
                     payload = self._require_json_object()
@@ -1543,6 +1580,10 @@ def state_command(args):
     print_json(http_json(with_base_url(args.url, "/animation/state")))
 
 
+def uptime_command(args):
+    print_json(http_json(with_base_url(args.url, "/system/uptime")))
+
+
 def config_command(args):
     payload = {}
     if args.fade_step is not None:
@@ -1689,6 +1730,10 @@ def build_parser():
     add_common_url_argument(state_parser)
     state_parser.set_defaults(func=state_command)
 
+    uptime_parser = subparsers.add_parser("uptime", help="Call /system/uptime.")
+    add_common_url_argument(uptime_parser)
+    uptime_parser.set_defaults(func=uptime_command)
+
     config_parser = subparsers.add_parser("config", help="Call /animation/config.")
     add_common_url_argument(config_parser)
     config_parser.add_argument("--fade-step", type=int, help="New fade_step value.")
@@ -1789,6 +1834,7 @@ def main():
         "ui",
         "ping",
         "state",
+        "uptime",
         "config",
         "install",
         "reset",
