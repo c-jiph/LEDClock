@@ -5,6 +5,7 @@ import adafruit_httpserver
 import adafruit_ntp
 import board
 import busio
+import mdns
 import microcontroller
 import neopixel
 import rtc
@@ -25,6 +26,7 @@ else:
 PIXEL_COUNT = 60
 BRIGHTNESS = 0.2
 SERVER_PORT = 81
+MDNS_HOSTNAME = "ledclock"
 MAX_CONSECUTIVE_NTP_FAILURES = 5
 UI_ROOT = "/ui"
 AMBIENT_SAMPLE_INTERVAL_S = 5
@@ -125,6 +127,17 @@ def connect_wifi():
     print("Connecting to WiFi...")
     wifi.radio.connect(secrets["ssid"], secrets["password"])
     print(f"Connected to WiFi! IP: {wifi.radio.ipv4_address}")
+
+
+def start_mdns():
+    print(f"Starting mDNS as {MDNS_HOSTNAME}.local")
+    mdns_server = mdns.Server(wifi.radio)
+    mdns_server.hostname = MDNS_HOSTNAME
+    mdns_server.advertise_service(
+        service_type="_http", protocol="_tcp", port=SERVER_PORT
+    )
+    print(f"mDNS HTTP service available at http://{MDNS_HOSTNAME}.local:{SERVER_PORT}")
+    return mdns_server
 
 
 class AmbientLightController:
@@ -412,6 +425,7 @@ class ClockHost:
         self.core = default_core_cls(platform)
         self.core_source = None
         self.http_server = None
+        self.mdns_server = None
         self.last_sync_hour = -1
         self.consecutive_ntp_failures = 0
         self.start_monotonic = time.monotonic()
@@ -776,6 +790,7 @@ def main():
 
     host.rainbow_animation_frame(0)
     connect_wifi()
+    host.mdns_server = start_mdns()
     host.start_http()
 
     print("Starting clock display...")
