@@ -1,8 +1,10 @@
+import json
 import time
 
 import adafruit_httpserver
 import adafruit_ntp
 import board
+import busio
 import neopixel
 import rtc
 import socketpool
@@ -12,10 +14,31 @@ from adafruit_httpserver import POST, PUT
 
 from animation import ClockAnimationCore, ClockPlatform, load_core_class_from_source, wheel
 
-PIXEL_PIN = board.IO16 if "FooToy" in sys.implementation._machine else board.IO0
+IS_AI_THINKER_CAM = "Ai Thinker ESP32-CAM with ESP32" in sys.implementation._machine
+if IS_AI_THINKER_CAM:
+    PIXEL_PIN = board.IO13
+elif "FooToy" in sys.implementation._machine:
+    PIXEL_PIN = board.IO16
+else:
+    PIXEL_PIN = board.IO0
 PIXEL_COUNT = 60
 BRIGHTNESS = 0.2
 SERVER_PORT = 81
+AMBIENT_SAMPLE_INTERVAL_S = 5
+MIN_PIXEL_BRIGHTNESS = 0.03
+MAX_PIXEL_BRIGHTNESS = 0.8
+BRIGHTNESS_SMOOTHING = 0.25
+AMBIENT_SETTINGS_FILE = "ambient_settings.json"
+DEFAULT_AMBIENT_SETTINGS = {
+    "dark_luma": 0.0,
+    "bright_luma": 1.0,
+    "min_pixel_brightness": MIN_PIXEL_BRIGHTNESS,
+    "max_pixel_brightness": MAX_PIXEL_BRIGHTNESS,
+    "sample_interval_s": float(AMBIENT_SAMPLE_INTERVAL_S),
+    "brightness_smoothing": BRIGHTNESS_SMOOTHING,
+    "manual_agc_gain": None,
+    "manual_aec_value": None,
+}
 
 # WiFi credentials
 try:
@@ -101,14 +124,293 @@ def connect_wifi():
     print(f"Connected to WiFi! IP: {wifi.radio.ipv4_address}")
 
 
+class AmbientLightController:
+    def __init__(self, pixels):
+        self.pixels = pixels
+        self.camera = None
+        self.settings_path = AMBIENT_SETTINGS_FILE
+        self.settings = self._load_settings()
+        self.persisted_settings = dict(self.settings)
+        self.last_sample_monotonic = -self.settings["sample_interval_s"]
+        self.last_luma = None
+        self.last_target_brightness = pixels.brightness
+        self.last_applied_brightness = pixels.brightness
+
+        if not IS_AI_THINKER_CAM:
+            print("Ambient light sensing disabled: board has no built-in camera")
+            return
+
+        try:
+            import espcamera
+        except ImportError as exc:
+            print(f"Ambient light sensing unavailable: {exc}")
+            return
+
+        try:
+            if PIXEL_PIN == board.CAMERA_XCLK:
+                print(
+                    "Ambient light sensing disabled: pixel pin conflicts with camera XCLK "
+                    f"({PIXEL_PIN})"
+                )
+                return
+            camera_i2c = busio.I2C(board.CAMERA_SIOC, board.CAMERA_SIOD)
+            if isinstance(board.CAMERA_DATA, tuple):
+                data_pins = board.CAMERA_DATA
+            else:
+                data_pins = (
+                    board.CAMERA_DATA,
+                    board.CAMERA_DATA2,
+                    board.CAMERA_DATA3,
+                    board.CAMERA_DATA4,
+                    board.CAMERA_DATA5,
+                    board.CAMERA_DATA6,
+                    board.CAMERA_DATA7,
+                    board.CAMERA_DATA8,
+                )
+            self.camera = espcamera.Camera(
+                data_pins=data_pins,
+                pixel_clock_pin=board.CAMERA_PCLK,
+                vsync_pin=board.CAMERA_VSYNC,
+                href_pin=board.CAMERA_HREF,
+                i2c=camera_i2c,
+                external_clock_pin=board.CAMERA_XCLK,
+                powerdown_pin=board.CAMERA_PWDN,
+                pixel_format=espcamera.PixelFormat.GRAYSCALE,
+                frame_size=espcamera.FrameSize.R96X96,
+                framebuffer_count=1,
+                grab_mode=espcamera.GrabMode.WHEN_EMPTY,
+            )
+            self._disable_auto_camera_adjustments()
+            self._initialize_manual_camera_settings()
+            self._apply_camera_settings()
+            print("Ambient light sensing enabled with on-board camera")
+        except Exception as exc:
+            print(f"Ambient light sensing init failed: {exc}")
+            self.camera = None
+
+    def _load_settings(self):
+        settings = dict(DEFAULT_AMBIENT_SETTINGS)
+        try:
+            with open(self.settings_path, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                settings.update(
+                    {
+                        key: loaded[key]
+                        for key in DEFAULT_AMBIENT_SETTINGS
+                        if key in loaded
+                    }
+                )
+            else:
+                self._save_settings(settings)
+        except OSError:
+            self._save_settings(settings)
+        except ValueError:
+            self._save_settings(settings)
+        return settings
+
+    def _save_settings(self, settings):
+        with open(self.settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+
+    def _initialize_manual_camera_settings(self):
+        changed = False
+        if self.settings["manual_agc_gain"] is None:
+            self.settings["manual_agc_gain"] = self.camera.agc_gain
+            changed = True
+        if self.settings["manual_aec_value"] is None:
+            self.settings["manual_aec_value"] = self.camera.aec_value
+            changed = True
+        if changed and self.persisted_settings == DEFAULT_AMBIENT_SETTINGS:
+            self.commit_settings()
+
+    def _disable_auto_camera_adjustments(self):
+        self.camera.whitebal = False
+        self.camera.awb_gain = False
+        self.camera.gain_ctrl = False
+        self.camera.exposure_ctrl = False
+        self.camera.aec2 = False
+        print(
+            "Ambient light camera auto controls disabled: "
+            "whitebal, awb_gain, gain_ctrl, exposure_ctrl, aec2"
+        )
+
+    def _apply_camera_settings(self):
+        if self.camera is None:
+            return
+        self.camera.agc_gain = int(self.settings["manual_agc_gain"])
+        self.camera.aec_value = int(self.settings["manual_aec_value"])
+
+    def _clamp_settings(self):
+        self.settings["min_pixel_brightness"] = max(
+            0.0, min(1.0, float(self.settings["min_pixel_brightness"]))
+        )
+        self.settings["max_pixel_brightness"] = max(
+            self.settings["min_pixel_brightness"],
+            min(1.0, float(self.settings["max_pixel_brightness"])),
+        )
+        self.settings["sample_interval_s"] = max(
+            0.1, float(self.settings["sample_interval_s"])
+        )
+        self.settings["brightness_smoothing"] = max(
+            0.0, min(1.0, float(self.settings["brightness_smoothing"]))
+        )
+        self.settings["dark_luma"] = max(0.0, min(1.0, float(self.settings["dark_luma"])))
+        self.settings["bright_luma"] = max(
+            self.settings["dark_luma"],
+            min(1.0, float(self.settings["bright_luma"])),
+        )
+        if self.settings["manual_agc_gain"] is not None:
+            self.settings["manual_agc_gain"] = int(self.settings["manual_agc_gain"])
+        if self.settings["manual_aec_value"] is not None:
+            self.settings["manual_aec_value"] = int(self.settings["manual_aec_value"])
+
+    def _capture_average_luma(self):
+        frame = self.camera.take(1)
+        if frame is None:
+            return None
+
+        width = self.camera.width
+        height = self.camera.height
+        step_x = max(1, width // 8)
+        step_y = max(1, height // 8)
+
+        total = 0
+        count = 0
+        for y in range(0, height, step_y):
+            for x in range(0, width, step_x):
+                total += frame[(y * width) + x]
+                count += 1
+
+        if count == 0:
+            return None
+        return total / (count * 255)
+
+    def capture_luma(self):
+        if self.camera is None:
+            raise RuntimeError("Ambient light camera is unavailable")
+        luma = self._capture_average_luma()
+        if luma is None:
+            raise RuntimeError("Ambient light capture timed out")
+        self.last_luma = luma
+        return luma
+
+    def get_status(self):
+        return {
+            "enabled": self.camera is not None,
+            "settings_path": self.settings_path,
+            "settings": dict(self.settings),
+            "persisted_settings": dict(self.persisted_settings),
+            "dirty": self.settings != self.persisted_settings,
+            "last_luma": self.last_luma,
+            "last_target_brightness": self.last_target_brightness,
+            "last_applied_brightness": self.last_applied_brightness,
+        }
+
+    def update_settings(self, data):
+        for key in DEFAULT_AMBIENT_SETTINGS:
+            if key in data:
+                self.settings[key] = data[key]
+        self._clamp_settings()
+        if self.camera is not None:
+            self._apply_camera_settings()
+        return self.get_status()
+
+    def commit_settings(self):
+        self._clamp_settings()
+        self._save_settings(self.settings)
+        self.persisted_settings = dict(self.settings)
+        return self.get_status()
+
+    def reset_settings(self):
+        self.settings = dict(DEFAULT_AMBIENT_SETTINGS)
+        if self.camera is not None:
+            self._initialize_manual_camera_settings()
+            self._apply_camera_settings()
+        self._clamp_settings()
+        self._save_settings(self.settings)
+        self.persisted_settings = dict(self.settings)
+        return self.get_status()
+
+    def sample(self, role=None, brightness=None, luma=None):
+        if luma is None:
+            luma = self.capture_luma()
+        else:
+            luma = max(0.0, min(1.0, float(luma)))
+            self.last_luma = luma
+
+        if role == "dark":
+            self.settings["dark_luma"] = luma
+            if brightness is not None:
+                self.settings["min_pixel_brightness"] = brightness
+        elif role == "bright":
+            self.settings["bright_luma"] = luma
+            if brightness is not None:
+                self.settings["max_pixel_brightness"] = brightness
+        elif role not in (None, ""):
+            raise ValueError("role must be 'dark', 'bright', or omitted")
+
+        self._clamp_settings()
+        status = self.get_status()
+        status["sample"] = {
+            "role": role,
+            "luma": luma,
+        }
+        return status
+
+    def update(self):
+        if self.camera is None:
+            return
+
+        now = time.monotonic()
+        if (now - self.last_sample_monotonic) < self.settings["sample_interval_s"]:
+            return
+        self.last_sample_monotonic = now
+
+        try:
+            luma = self._capture_average_luma()
+        except Exception as exc:
+            print(f"Ambient light capture failed: {exc}")
+            return
+
+        if luma is None:
+            print("Ambient light capture timed out")
+            return
+
+        self.last_luma = luma
+        span = max(
+            0.001, self.settings["bright_luma"] - self.settings["dark_luma"]
+        )
+        normalized_luma = max(
+            0.0, min(1.0, (luma - self.settings["dark_luma"]) / span)
+        )
+        target = self.settings["min_pixel_brightness"] + (
+            (self.settings["max_pixel_brightness"] - self.settings["min_pixel_brightness"])
+            * normalized_luma
+        )
+        current = self.pixels.brightness
+        brightness = current + (
+            (target - current) * self.settings["brightness_smoothing"]
+        )
+        self.pixels.brightness = brightness
+        self.last_target_brightness = target
+        self.last_applied_brightness = brightness
+        print(
+            "Ambient light level=" +
+            f"{luma:.3f} target_brightness={target:.3f} " +
+            f"applied_brightness={brightness:.3f}"
+        )
+
+
 class ClockHost:
-    def __init__(self, platform, default_core_cls):
+    def __init__(self, platform, default_core_cls, ambient_light_controller=None):
         self.platform = platform
         self.default_core_cls = default_core_cls
         self.core = default_core_cls(platform)
         self.core_source = None
         self.http_server = None
         self.last_sync_hour = -1
+        self.ambient_light_controller = ambient_light_controller
 
     def rainbow_animation_frame(self, offset):
         for i in range(self.platform.pixel_count):
@@ -129,6 +431,8 @@ class ClockHost:
     def get_state(self):
         state = self.core.get_state()
         state["source"] = "builtin" if self.core_source is None else "uploaded"
+        if self.ambient_light_controller is not None:
+            state["ambient_light"] = self.ambient_light_controller.get_status()
         return state
 
     def tick(self):
@@ -142,6 +446,8 @@ class ClockHost:
             current_time = self.platform.now()
 
         self.poll_http()
+        if self.ambient_light_controller is not None:
+            self.ambient_light_controller.update()
         self.core.tick(current_time=current_time)
 
     def make_webserver(self, socket_pool):
@@ -238,6 +544,70 @@ class ClockHost:
                 return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
             return adafruit_httpserver.JSONResponse(request, response)
 
+        @server.route("/ambient/state")
+        def ambient_state(request):
+            print("HTTP GET /ambient/state")
+            if self.ambient_light_controller is None:
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Ambient light controller unavailable"}
+                )
+            return adafruit_httpserver.JSONResponse(
+                request, self.ambient_light_controller.get_status()
+            )
+
+        @server.route("/ambient/config", [PUT, POST])
+        def ambient_config(request):
+            data = request.json()
+            print(f"HTTP {request.method} /ambient/config payload={data}")
+            if not isinstance(data, dict):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Expected JSON object"}
+                )
+            try:
+                status = self.ambient_light_controller.update_settings(data)
+            except Exception as exc:
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, status)
+
+        @server.route("/ambient/sample", [POST, PUT])
+        def ambient_sample(request):
+            data = request.json()
+            print(f"HTTP {request.method} /ambient/sample payload={data}")
+            if data is None:
+                data = {}
+            if not isinstance(data, dict):
+                return adafruit_httpserver.JSONResponse(
+                    request, {"error": "Expected JSON object"}
+                )
+            role = data.get("role")
+            brightness = data.get("brightness")
+            luma = data.get("luma")
+            try:
+                status = self.ambient_light_controller.sample(
+                    role=role, brightness=brightness, luma=luma
+                )
+            except Exception as exc:
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, status)
+
+        @server.route("/ambient/commit", [POST, PUT])
+        def ambient_commit(request):
+            print(f"HTTP {request.method} /ambient/commit")
+            try:
+                status = self.ambient_light_controller.commit_settings()
+            except Exception as exc:
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, status)
+
+        @server.route("/ambient/reset", [POST, PUT])
+        def ambient_reset(request):
+            print(f"HTTP {request.method} /ambient/reset")
+            try:
+                status = self.ambient_light_controller.reset_settings()
+            except Exception as exc:
+                return adafruit_httpserver.JSONResponse(request, {"error": str(exc)})
+            return adafruit_httpserver.JSONResponse(request, status)
+
         base_url = f"http://{wifi.radio.ipv4_address}:{SERVER_PORT}"
         print(f"Starting HTTP server at {base_url}")
         print(f"  {base_url}/animation/ping")
@@ -246,6 +616,11 @@ class ClockHost:
         print(f"  {base_url}/animation/install")
         print(f"  {base_url}/animation/reset")
         print(f"  {base_url}/animation/core")
+        print(f"  {base_url}/ambient/state")
+        print(f"  {base_url}/ambient/config")
+        print(f"  {base_url}/ambient/sample")
+        print(f"  {base_url}/ambient/commit")
+        print(f"  {base_url}/ambient/reset")
         server.start(port=SERVER_PORT)
         self.http_server = server
         return server
@@ -266,7 +641,12 @@ def main():
         PIXEL_PIN, PIXEL_COUNT, brightness=BRIGHTNESS, auto_write=False
     )
     platform = ClockPlatform(pixels)
-    host = ClockHost(platform, ClockAnimationCore)
+    ambient_light_controller = AmbientLightController(pixels)
+    host = ClockHost(
+        platform,
+        ClockAnimationCore,
+        ambient_light_controller=ambient_light_controller,
+    )
 
     host.rainbow_animation_frame(0)
     connect_wifi()
