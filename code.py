@@ -11,7 +11,7 @@ import rtc
 import socketpool
 import sys
 import wifi
-from adafruit_httpserver import POST, PUT
+from adafruit_httpserver import POST, PUT, FileResponse
 
 from animation import ClockAnimationCore, ClockPlatform, load_core_class_from_source, wheel
 
@@ -26,6 +26,7 @@ PIXEL_COUNT = 60
 BRIGHTNESS = 0.2
 SERVER_PORT = 81
 MAX_CONSECUTIVE_NTP_FAILURES = 5
+UI_ROOT = "/ui"
 AMBIENT_SAMPLE_INTERVAL_S = 5
 MIN_PIXEL_BRIGHTNESS = 0.03
 MAX_PIXEL_BRIGHTNESS = 0.8
@@ -443,6 +444,42 @@ class ClockHost:
     def get_uptime_s(self):
         return time.monotonic() - self.start_monotonic
 
+    def dashboard(self):
+        return {
+            "mode": "device",
+            "target_url": None,
+            "ping": {
+                "ip": str(wifi.radio.ipv4_address),
+                "name": self.core.NAME,
+                "version": self.core.VERSION,
+                "uptime_s": self.get_uptime_s(),
+            },
+            "state": self.get_state(),
+            "uptime": {"uptime_s": self.get_uptime_s()},
+            "ambient": (
+                self.ambient_light_controller.get_status()
+                if self.ambient_light_controller is not None
+                else None
+            ),
+            "pixels": None,
+            "history": [],
+        }
+
+    def ui_file_response(self, request, filename, content_type):
+        headers = {}
+        if filename.endswith(".gz"):
+            headers["Content-Encoding"] = "gzip"
+            headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        elif filename.endswith(".html"):
+            headers["Cache-Control"] = "no-cache"
+        return FileResponse(
+            request,
+            filename=filename,
+            root_path=UI_ROOT,
+            content_type=content_type,
+            headers=headers,
+        )
+
     def tick(self):
         current_time = self.platform.now()
         if current_time.tm_hour != self.last_sync_hour:
@@ -476,6 +513,44 @@ class ClockHost:
     def make_webserver(self, socket_pool):
         server = adafruit_httpserver.Server(socket_pool, debug=True)
 
+        @server.route("/")
+        @server.route("/index.html")
+        def ui_index(request):
+            print(f"HTTP GET {request.path}")
+            return self.ui_file_response(
+                request, "index.html", "text/html; charset=utf-8"
+            )
+
+        @server.route("/assets/vendor/pico.min.css.gz")
+        def ui_pico_css(request):
+            print(f"HTTP GET {request.path}")
+            return self.ui_file_response(
+                request,
+                "assets/vendor/pico.min.css.gz",
+                "text/css; charset=utf-8",
+            )
+
+        @server.route("/assets/vendor/chart.umd.min.js.gz")
+        def ui_chart_js(request):
+            print(f"HTTP GET {request.path}")
+            return self.ui_file_response(
+                request,
+                "assets/vendor/chart.umd.min.js.gz",
+                "application/javascript; charset=utf-8",
+            )
+
+        @server.route("/licenses/pico-MIT.txt")
+        @server.route("/licenses/chartjs-MIT.txt")
+        @server.route("/THIRD_PARTY_NOTICES.md")
+        def ui_license_files(request):
+            print(f"HTTP GET {request.path}")
+            path = request.path.lstrip("/")
+            if path == "THIRD_PARTY_NOTICES.md":
+                return self.ui_file_response(
+                    request, "THIRD_PARTY_NOTICES.md", "text/plain; charset=utf-8"
+                )
+            return self.ui_file_response(request, path, "text/plain; charset=utf-8")
+
         @server.route("/animation/ping")
         def ping(request):
             print("HTTP GET /animation/ping")
@@ -489,23 +564,31 @@ class ClockHost:
                 },
             )
 
+        @server.route("/api/dashboard")
+        def api_dashboard(request):
+            print("HTTP GET /api/dashboard")
+            return adafruit_httpserver.JSONResponse(request, self.dashboard())
+
         @server.route("/system/uptime")
+        @server.route("/api/system/uptime")
         def system_uptime(request):
-            print("HTTP GET /system/uptime")
+            print(f"HTTP GET {request.path}")
             return adafruit_httpserver.JSONResponse(
                 request,
                 {"uptime_s": self.get_uptime_s()},
             )
 
         @server.route("/animation/state")
+        @server.route("/api/animation/state")
         def animation_state(request):
-            print("HTTP GET /animation/state")
+            print(f"HTTP GET {request.path}")
             return adafruit_httpserver.JSONResponse(request, self.get_state())
 
         @server.route("/animation/config", [PUT, POST])
+        @server.route("/api/animation/config", [PUT, POST])
         def animation_config(request):
             data = request.json()
-            print(f"HTTP {request.method} /animation/config payload={data}")
+            print(f"HTTP {request.method} {request.path} payload={data}")
             if not isinstance(data, dict):
                 return adafruit_httpserver.JSONResponse(
                     request, {"error": "Expected JSON object"}
@@ -517,9 +600,10 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, state)
 
         @server.route("/animation/install", [POST, PUT])
+        @server.route("/api/animation/install", [POST, PUT])
         def animation_install(request):
             data = request.json()
-            print(f"HTTP {request.method} /animation/install")
+            print(f"HTTP {request.method} {request.path}")
             if not isinstance(data, dict) or "source" not in data:
                 return adafruit_httpserver.JSONResponse(
                     request, {"error": "Expected JSON object with source"}
@@ -542,8 +626,9 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, {"ok": True, "state": state})
 
         @server.route("/animation/reset", [POST, PUT])
+        @server.route("/api/animation/reset", [POST, PUT])
         def animation_reset(request):
-            print(f"HTTP {request.method} /animation/reset")
+            print(f"HTTP {request.method} {request.path}")
             state = self.reset_core()
             print(f"Reset to core {state['name']} v{state['version']}")
             return adafruit_httpserver.JSONResponse(
@@ -551,9 +636,10 @@ class ClockHost:
             )
 
         @server.route("/animation/core", [POST, PUT])
+        @server.route("/api/animation/core", [POST, PUT])
         def animation_core(request):
             data = request.json()
-            print(f"HTTP {request.method} /animation/core payload={data}")
+            print(f"HTTP {request.method} {request.path} payload={data}")
             if not isinstance(data, dict):
                 return adafruit_httpserver.JSONResponse(
                     request, {"error": "Expected JSON object"}
@@ -577,8 +663,9 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, response)
 
         @server.route("/ambient/state")
+        @server.route("/api/ambient/state")
         def ambient_state(request):
-            print("HTTP GET /ambient/state")
+            print(f"HTTP GET {request.path}")
             if self.ambient_light_controller is None:
                 return adafruit_httpserver.JSONResponse(
                     request, {"error": "Ambient light controller unavailable"}
@@ -588,9 +675,10 @@ class ClockHost:
             )
 
         @server.route("/ambient/config", [PUT, POST])
+        @server.route("/api/ambient/config", [PUT, POST])
         def ambient_config(request):
             data = request.json()
-            print(f"HTTP {request.method} /ambient/config payload={data}")
+            print(f"HTTP {request.method} {request.path} payload={data}")
             if not isinstance(data, dict):
                 return adafruit_httpserver.JSONResponse(
                     request, {"error": "Expected JSON object"}
@@ -602,9 +690,10 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, status)
 
         @server.route("/ambient/sample", [POST, PUT])
+        @server.route("/api/ambient/sample", [POST, PUT])
         def ambient_sample(request):
             data = request.json()
-            print(f"HTTP {request.method} /ambient/sample payload={data}")
+            print(f"HTTP {request.method} {request.path} payload={data}")
             if data is None:
                 data = {}
             if not isinstance(data, dict):
@@ -623,8 +712,9 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, status)
 
         @server.route("/ambient/commit", [POST, PUT])
+        @server.route("/api/ambient/commit", [POST, PUT])
         def ambient_commit(request):
-            print(f"HTTP {request.method} /ambient/commit")
+            print(f"HTTP {request.method} {request.path}")
             try:
                 status = self.ambient_light_controller.commit_settings()
             except Exception as exc:
@@ -632,8 +722,9 @@ class ClockHost:
             return adafruit_httpserver.JSONResponse(request, status)
 
         @server.route("/ambient/reset", [POST, PUT])
+        @server.route("/api/ambient/reset", [POST, PUT])
         def ambient_reset(request):
-            print(f"HTTP {request.method} /ambient/reset")
+            print(f"HTTP {request.method} {request.path}")
             try:
                 status = self.ambient_light_controller.reset_settings()
             except Exception as exc:
@@ -642,9 +733,11 @@ class ClockHost:
 
         base_url = f"http://{wifi.radio.ipv4_address}:{SERVER_PORT}"
         print(f"Starting HTTP server at {base_url}")
+        print(f"  {base_url}/")
         print(f"  {base_url}/animation/ping")
         print(f"  {base_url}/animation/state")
         print(f"  {base_url}/system/uptime")
+        print(f"  {base_url}/api/dashboard")
         print(f"  {base_url}/animation/config")
         print(f"  {base_url}/animation/install")
         print(f"  {base_url}/animation/reset")
