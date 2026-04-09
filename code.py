@@ -33,6 +33,7 @@ AMBIENT_SAMPLE_INTERVAL_S = 5
 MIN_PIXEL_BRIGHTNESS = 0.03
 MAX_PIXEL_BRIGHTNESS = 0.8
 BRIGHTNESS_SMOOTHING = 0.25
+PIXEL_INDEX_OFFSET = 29
 AMBIENT_SETTINGS_FILE = "ambient_settings.json"
 DEFAULT_AMBIENT_SETTINGS = {
     "dark_luma": 0.0,
@@ -138,6 +139,35 @@ def start_mdns():
     )
     print(f"mDNS HTTP service available at http://{MDNS_HOSTNAME}.local:{SERVER_PORT}")
     return mdns_server
+
+
+class PixelOffsetWrapper:
+    def __init__(self, pixels, offset):
+        self._pixels = pixels
+        self._offset = offset
+
+    def __len__(self):
+        return len(self._pixels)
+
+    def _map_index(self, index):
+        return (index + self._offset) % len(self._pixels)
+
+    def __getitem__(self, index):
+        return self._pixels[self._map_index(index)]
+
+    def __setitem__(self, index, value):
+        self._pixels[self._map_index(index)] = value
+
+    def show(self):
+        self._pixels.show()
+
+    @property
+    def brightness(self):
+        return self._pixels.brightness
+
+    @brightness.setter
+    def brightness(self, value):
+        self._pixels.brightness = value
 
 
 class AmbientLightController:
@@ -777,9 +807,10 @@ class ClockHost:
 
 
 def main():
-    pixels = neopixel.NeoPixel(
+    raw_pixels = neopixel.NeoPixel(
         PIXEL_PIN, PIXEL_COUNT, brightness=BRIGHTNESS, auto_write=False
     )
+    pixels = PixelOffsetWrapper(raw_pixels, PIXEL_INDEX_OFFSET)
     platform = ClockPlatform(pixels)
     ambient_light_controller = AmbientLightController(pixels)
     host = ClockHost(
